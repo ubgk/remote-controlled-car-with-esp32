@@ -1,0 +1,254 @@
+Remote Controlled RoboCar Documentation
+===
+# Overview
+For this assignment, we decided to go for a more hardware oriented project, and picked
+RoboCar. Rather than using a browser based controlling functionality, we decided
+it would be more fun to use a proper Xbox One Controller over **Bluetooth Classic**.
+
+[ ![](doc/robocar.png "Communication hierarchy")](/doc/robocar.png)
+
+## Master
+The Xbox Controller has its proprietary communication protocol, so without the resources, experience, time
+and intelligence required, we had to use an intermediary PC and communicate with the unPhone with
+our own "protocol". So, we developed a Java program that reads input from the controller using a library called
+jxinput and converts these into commands for the robot which we sent to ESP32. 
+
+We sent the commands to the RoboCar via **RFCOMM Protocol TDI**, which is an interface that provides an abstraction
+over Bluetooth, and allows us to connect to ESP32 using Windows' proprietary Bluetooth functionality and communicate over serial COM ports.
+Such an abstraction increases the **portability** of the code, as nothing would need to be changed for a different BT device, or even a wired USB connection. 
+
+We also thought about the level of messages sent to the robot. We could, directly pass the controller information without processing them on the PC, or we could use
+a library like **Firmata** which would allow us to control the ESP32 like a zombie, by just sending the pin values. Both these approaches had their inconveniences,
+sending controller commands directly to the unPhone would not be very sensible when we had an intermediary PC to process them. Additionally, this would make the RoboCar's code
+very controller dependent, requiring us to change the slave code for different controllers.
+
+On the other hand, using protocols like Firmata would be both compromising on the IoT spirit by having no computation at the endpoint, and cumbersome by having to deal with I2C between the board and the motor driver
+from the Master device.
+
+If the RoboCar comes too close to an obstacle (< 20cm), the RoboCar sends a warning to the PC. The PC then vibrates the controller, and pushes an **IFTTT** message
+to warn the operator. We chose to trigger IFTTT from the PC (acting as a **gateway**) because, the current code base with additional HTTP Libraries would take too much flash memory, and
+it would also be more sensible to use the PC given the topology of the device graph. Furthermore, we read that ESP32 had only one radio, so attempting to have Bluetooth
+and WiFi on the same board was likely to cause trouble. For the same reason, we also chose not to implement **OTA**, it wouldn't have been much useful when we would have constant access to the robot, anyway.
+
+### Controls and Operation
+*  Connect the controller to the PC.
+*  Wake up the unPhone and connect to it via Bluetooth.
+*  Run the Java app, wait until it establishes serial connection.
+*  In Tank Mode, use the left stick to control the left wheel and the right stick to control the right wheel. Pull the left trigger for braking, A for honking and B for switching off.
+*  In Arcade Mode, use the right stick to steer, the left trigger to brake, and the right trigger to accelerate.
+
+## Slave
+The robot is a simple Finite State Automaton, it changes its state depending on the input it receives.
+RoboCar and the master computer agree on a fixed message format. 
+Each message has 6 bytes of payload (this was compressed later), respectively representing left wheel speed, right wheel speed,
+left wheel direction, right wheel direction, buzzer, and a go-to-sleep command. Messages end with a sequence of 3 end bytes. (i.e. `0x7A`)
+
+[ ![](doc/flowChart.png "FSA")](./doc/flowChart.png)
+
+### Communication
+We decided to use Espressif's  `BluetoothSerial` library to implement the Bluetooth interface. 
+It is nearly identical to UART Serial in terms of its commands and operation. **BLE** was not a viable option
+for this project because we require continuous serial stream of data for short periods of time
+whereas BLE is suitable for exactly opposite scenarios.
+
+Having said that each message comprised a payload of 5 different variables, each represented by 
+a byte, we needed a way of knowing which byte represented what parameter. So, in order to interpret
+a message, we need to know where one message ends and where the other begins in an incessant stream of bytes like below:
+
+[ ![](doc/stream.png "Stream of bytes")](./doc/stream.png)
+Where does one message end and the other begin?
+
+There is more than one solution to this problem, we could either:
+*  Define illegal characters that could not be contained in the payload, so we would know a message was beginning
+or ending the moment we saw them. 
+
+or,
+
+* We could have a broader horizon, and pick a sequence of bytes such that it would not be possible to have
+that sequence in the payload.
+
+Whilst the first one is easier to implement, it is not very OCD-friendly to pick 
+an illegal value that our joysticks could not send and violate the continuity of the motor PWM range. So,
+we went for the second option and determined an end message byte `122`, that could only be contained twice
+in the payload, because the motor speeds would be followed by either a 1 or 0 representing the direction of
+our DC motors.
+
+
+Example of a valid message with the end byte:
+
+[ ![](doc/validTape.png "Example of a valid message")](doc/validTape.png)
+
+Now that we know how to tell the end of a message, we can write a function that tells whether the bytes
+in a given buffer represents a valid message. If so, we interpret the message and drive our motors and buzzer accordingly.
+If not, we pop one byte from the beginning and add read a new byte into the last cell of the container buffer like below:
+
+[ ![](doc/bufferPop.png "Sliding the message to the left")](doc/bufferPop.png)
+
+The **pseudocode** for the loop is as below:
+```
+long lastMessageReceived, lastMessageSent
+int bytesRead
+
+
+void loop(){
+    //if we are waiting too long for a message or the power is not adequate
+  if(currentTime-lastMessageReceived>TIMEOUT || !powerGood()){
+    deepSleep()
+  }
+  
+    //we read bytes into the buffer
+  bytesRead = Bluetooth.readBytes(buffer, MESSAGE_LENGTH);
+    if(bytesRead == MESSAGE_LENGTH && isValid(buffer)) //if we read enough many bytes and the buffer is a valid message
+        lastMessageReceived = millis()                         //update the last message receiving time
+        changeState()
+        buffer.flush() //we clean the buffer
+    
+    else
+        buffer.pop() //we shift the buffer to the left to create 1 byte space at the end
+        buffer[MESSAGE_LENGTH-1] = Bluetooth.incomingByte(); //we append a new byte at the end of the list
+        
+    if(currentTime-lastMessageSent>TIMEOUT){
+        Bluetooth.write(obstacle_detection());
+    }
+}
+```
+
+## Resource Management
+
+### Power Management
+[ ![](doc/voltadc.jpg "Volts to ADC Values")](doc/voltadc.jpg)
+
+This is not a project where power management is critical, as the AA batteries powering the DC motors would bottleneck any power saved on the LiPo batteries. However, unless all the batteries are depleted in one go, we still need some power managing to have an extended stanby duration.
+We wired two voltage dividers, LiPo divider had a Vout/Vin ratio of 0.75 where as the AA divider had a ratio of 0.5. At full capacity, the former would output 3.15V, 
+and the latter would output 3.2V, both slightly below the maximum, just where attenuation begins and readings max out at 4095 due to the non-linear characteristic of ESP-32 ADC, like the attenuation shown above. 
+This might seem trivial, however, LiPo batteries show very non-linear discharge behaviour with very slow decrease in voltage even if quite a bit of energy is discharged. 
+
+Below is an approximate schematic of the circuit. There is no ESP32 on Fritzing, so we used an Arduino Nano to represent the voltage dividers, the buzzer and the wake-up button.
+
+[ ![](doc/schem.png "Representative Schematic of the Circuit")](doc/schem.png)
+
+We knew from the first assignment that ESP32 had two different **Successive Approximation Registers** and WiFi has started, 
+only pins on ADC #1 can be read. However, on my unPhone, for some reason, only pins A1 and A5 worked, but they are both on ADC #2,
+and the same limitation applied to Bluetooth as well. So, during normal functioning both these pins read 4095. Adafruit also states that the boards come with an unexposed `A13` pin that is connected to the battery supply line with a voltage divider,
+but it gave a different voltage from the other working pins and a voltmeter. (Note: We later tried with another unPhone and the ADC #1 pins did not work there either.)
+
+The power management code behaves correctly if I use my ESP32 FeatherWing on ADC #1 pins, or if the Bluetooth is disabled on the unPhone.
+
+Power management proves useful in extending the standby life of the robot if it is not used actively. There are several ways a deep sleep can be triggered:
+*  No new messages are received for a set period of time (2 mins)
+*  User presses the kill button on the gamepad
+*  AA battery voltage drops below a threshold (there is no point in sleeping when the LiPo voltage is low, but we still measure it)
+
+The deep sleep can be interrupted by pressing the push button on the robot again.
+
+Some events are **scheduled**. We read the ultrasonic sensor periodically after a set amount of time's elapsed since last readings. Battery measurements are scheduled for every 10000 iterations.
+
+### Memory Management and Compression with Bitwise Operations
+Although we have 512KB of **SRAM**, (way more than the 37 KB the program needs) ESP32 has 4MB of Flash Memory (where the program code resides, 884KB used), we still looked after memory usage. Although we cannot move variables like the buffer array,
+we can treat the Strings etc. in debug print statements, and move them over to the flash memory by using the **F() macro** we had used in the first lab too. Also, we did not define pin numbers as variables but used `#define` macros,
+so they would be replaced at compile time, not taking up memory space.
+
+We also realised that using 4 bytes for coding 4 boolean values was wasteful, so these can be compressed into a single flag byte using bitwise operands. Reducing the size of a message from the initial 9 
+bytes to 6. We extract individual bits with **bitmasks** using a bitwise & operand like this: `uint8_t buzzer = (byte_received & 0b100)`. The new compressed message format with a flag byte looks like below:
+
+[ ![](doc/compressed.png "Example of a Flag Byte")](compressed.png)
+
+Additionally, we also found out that lower PWM values were essentially useless because they did not produce enough torque to move robot. Any value below 25-30 could be used as an end message byte, decreasing the 
+total message length by further two bytes, giving us 50% compression. However, we only implemented the first, leaving the messages at 6 bytes.
+
+## Testing
+Functions were tested independently in small sketches, and then brought together. All of the testing was manual, i.e. (pseudocode)
+```
+buffer[] = {1,2,3,4,5,6}; 
+bufferPop();
+Serial.println(buffer[] == {2,3,4,5,6,0});
+```
+Java code was easier to test, by not requiring constant flashing and compiling. Retrospectively, it would have been easier if we had just tested C/C++ code on PC where they were not hardware dependant.
+### 255 = -128, huh?
+In C/C++, a byte is an unsigned number within the range 0-255. However, for Java, a byte is a number between -128 and 127. A byte's first bit represents the sign of it.
+So whenever we sent a byte from ESP32 to Java, it would be misinterpreted. We had to account for this in our code by careful using of type casting and bitwise operations. A char for instance,
+is unambigous, represented by the same byte on both platforms. It is why we picked the character 'z' to represent the ending byte 122 on both systems, we could have equally used its HEX equivalent `0x7a` defining a byte.
+
+
+## Getting Hands Dirty
+### Simple H-Bridge circuit
+Just for fun, we built our own simple H-bridge circuit, in order to replace our FeatherWing DC motor driver. (not included in the final robot)
+
+[ ![](doc/hBridge.png "H-Bridge Circuit")](doc/hBridge.png) 
+
+The circuit is built using 4 transistors (2 PNPs and 2 NPNs). A PNP transistor lets current through when its base is low, and vice versa for NPN transistors. 2 pairs of transistors
+are used to control direction of the current through motors. Using PWM, motors' speeds can be controlled just in the same way as controlling the brightness of an LED.
+
+[ ![](doc/hBridgeDiagram.png "Diagram of how H-bridge work")](doc/hBridgeDiagram.png)
+
+### From Breadboard to Soldered Circuits
+Once we were sure that everything was functional, we 3D printed HC-SR04 sensor mounts and soldered components onto the Expander board.
+[ ![](doc/soldered.png "Two Versions")](soldered.png) 
+
+## Other ideas we had along the way...
+*  We think about tying the accelerometer to the IFTTT function, sending a message at impact.
+*  We also think to implement an autonomous mode with a PIR Sensor attached to patrol around a site, and send an alarm when an intruder is spotted.
+*  We thought about simulating Ackermann steering geometry, and even implemented a fully working class. However, this introduced an unbearable lag of 2-3 seconds, so we did not include it in the final product.
+*  If we had more time, we would have also liked to expand our communication protocol to include a handshake to exchange keys, and encrypt transmitted bytes using them. We're not sure if we could manage this, but we would have liked to work more on bits and bytes.
+
+
+# Instructions
+## Controls
+### Shared Controls
+*  **Button A:** horn
+*  **Button B:** kill the Java process and put the RoboCar in deep sleep
+*  **Button X:** toggle between driving modes/regimes
+*  **Left Trigger (LT):** brake
+
+### Tank Regime
+*  **Left Stick:** left track/wheel
+*  **Right Stick:** rigth track/wheel
+
+
+### Arcade Driving Regime
+*  **Right Stick:** steering
+*  **Right Trigger (RT):** accelerate
+
+
+## Setup and Troubleshooting
+You need to run `Controller.java` on your computer and flash the compiled `main.cpp` file onto your robot. Pair your device, then go to Devices and printers (Windows 10), and right click on your device. 
+Select properties, and find the port number on "Hardware" tab. Change the Java code accordingly to the correct port number. Make sure the device is awake by pressing the wake up button. If you cannot connect, go to Device Manager, and check that RFCOMM Protocol TDI is running under Bluetooth devices. If not, restart the "device" or reboot your computer.
+
+In order to run the Java code, you need the following set up properly:
+*  https://github.com/StrikerX3/JXInput
+*  https://fazecast.github.io/jSerialComm/
+*  https://hc.apache.org/httpcomponents-core-4.4.x/httpcore/apidocs/org/apache/http/package-summary.html
+*  https://hc.apache.org/httpcomponents-client-4.5.x/httpclient/apidocs/org/apache/http/client/methods/HttpPost.html
+*  https://hc.apache.org/httpcomponents-client-4.5.x/httpclient/apidocs/org/apache/http/impl/client/HttpClientBuilder.html
+
+
+```
+//Controller Libraries
+import com.github.strikerx3.jxinput.*;
+import com.github.strikerx3.jxinput.enums.XInputBatteryDeviceType;
+import com.github.strikerx3.jxinput.exceptions.XInputNotLoadedException;
+
+//Apache Http Libraries to send an HTTP Request to IFTTT
+import org.apache.http.*;
+import org.apache.http.client.*;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.impl.client.HttpClientBuilder;
+
+//Other libraries...
+import com.fazecast.jSerialComm.*;
+import java.io.IOException;
+import java.util.Arrays; //for buffer manipulation
+```
+
+
+
+
+
+# Sources
+1.  https://github.com/espressif/arduino-esp32/blob/master/tools/sdk/include/bt/esp_bt.h (Espresif's Serial Bluetooth library)
+2.  https://github.com/StrikerX3/JXInput
+3.  https://arduino.stackexchange.com/questions/9306/can-i-control-my-arduino-using-just-a-2-4ghz-wireless-transceiver-and-a-wireless/9318 (Xbox Controller's proprietary protocol)
+4.  https://answers.microsoft.com/en-us/windows/forum/windows8_1-hardware/what-is-bluetooth-device-rfcomm-protocol-tdi/f3790d24-dab3-444d-95f5-827d7c49a411 (RFCOMM Protocol TDI)
+5.  https://stackoverflow.com/questions/34673526/talk-to-i2c-devices-connected-to-arduino-from-processing
+6.  https://www.build-electronic-circuits.com/h-bridge/
+7.  https://www.esp32.com/viewtopic.php?t=2881 (Volts to ADC Values Attenuation)
